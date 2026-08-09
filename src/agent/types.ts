@@ -35,7 +35,17 @@ export type AgentEvent =
       turns?: number;
       totalTokens?: number;
     }
+  // Terminal events of a compaction run (see compact.ts). They never appear in a
+  // prompt run's stream, and telegram.ts ignores them.
+  | { kind: "compact_done"; preTokens?: number; postTokens?: number }
+  | { kind: "compact_failed"; reason: string }
   | { kind: "error"; message: string; class?: AgentError };
+
+/** The terminal event of a compaction run: it either compacted, or it did not. */
+export type CompactEvent = Extract<
+  AgentEvent,
+  { kind: "compact_done" | "compact_failed" }
+>;
 
 /** The event queue bridged from an Effect producer fiber to the AsyncGenerator consumer. */
 export type EventQueue = Queue.Queue<AgentEvent, Cause.Done>;
@@ -61,6 +71,8 @@ export interface Choice {
 
 /** Feature flags describing what a provider supports */
 export interface ProviderCapabilities {
+  /** In-place session compaction (`/compact`); true iff the provider has `compact`. */
+  compaction: boolean;
   cost: boolean;
   planMode: boolean;
   subagents: boolean;
@@ -106,6 +118,16 @@ export type ProviderSpec =
 /** Full provider definition: spec plus capabilities and session history access */
 export type AgentProvider = ProviderSpec & {
   capabilities: ProviderCapabilities;
+  /**
+   * Summarize `opts.sessionId` in place, keeping the session id so the next turn
+   * continues the same conversation. Same shape as an `sdk` run — one run, one
+   * terminal `compact_done`/`compact_failed` event — so the generic runner drives
+   * it unchanged. Absent when `capabilities.compaction` is false.
+   */
+  compact?: (
+    opts: RunOptions,
+    signal: AbortSignal
+  ) => AsyncGenerator<AgentEvent>;
   clearSessionCache: () => void;
   displayName: string;
   /** Selectable models; first entry is the `"default"` sentinel (no override). */

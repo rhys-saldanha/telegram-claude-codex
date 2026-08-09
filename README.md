@@ -168,6 +168,7 @@ If `loginctl enable-linger` needs privilege on your host, install prints the exa
 | `/stop` | Kill running agent process |
 | `/status` | Show active project, provider & process state |
 | `/new` | Clear session, start fresh conversation |
+| `/compact` | Summarize the active session in place, keeping it (Claude Code only) |
 | `/compose` | Start collecting messages into a batch |
 | `/send` | Send all composed messages as one prompt |
 | `/cancel` | Cancel compose mode, discard messages |
@@ -180,6 +181,12 @@ Text messages are forwarded to the active coding agent as prompts. Voice message
 ### Switching Providers
 
 Use `/provider` to pick between Claude Code and OpenAI Codex via an inline keyboard. The choice is global, persisted across restarts, and switching auto-stops any running process. The active provider is shown in `/status`, `/help`, the pinned project message, and the startup message. Sessions are tracked separately per provider, so `/history` and follow-up continuity stay scoped to whichever provider is active.
+
+### Compacting a Session
+
+Long conversations eventually fill the context window. `/compact` summarizes the active project's session for the active provider in place: the session id is unchanged, so the next message continues the same conversation instead of starting over as `/new` would. A run in flight is stopped first (as with `/new`), and the reply quotes the context size before and after when the provider reports it.
+
+Only Claude Code supports it — the Agent SDK reaches the CLI's own compaction by sending `/compact` as the prompt for the resumed session, and reports the result on a `compact_boundary` message. The Codex SDK (0.146.0) exposes no compaction API, so `/compact` declines for Codex and points at `/new` rather than clearing anything.
 
 ### Compose Mode
 

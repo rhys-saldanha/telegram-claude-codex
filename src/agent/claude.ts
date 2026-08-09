@@ -14,7 +14,12 @@ import {
 } from "./claude-history";
 import { userTurns } from "./claude-input";
 import { readExecutorMcpServers } from "./executor-mcp";
-import type { AgentEvent, AgentProvider, RunOptions } from "./types";
+import type {
+  AgentEvent,
+  AgentProvider,
+  CompactEvent,
+  RunOptions,
+} from "./types";
 
 /** The raw Anthropic stream event carried by an SDK partial-assistant message. */
 type StreamEvent = Extract<SDKMessage, { type: "stream_event" }>["event"];
@@ -364,12 +369,109 @@ async function* run(
   }
 }
 
+/**
+ * The CLI's manual-compaction command. The Agent SDK exposes no compaction
+ * control request; a slash command sent as the prompt is the documented way to
+ * trigger one (docs: agent-sdk/slash-commands). Compaction rewrites the resumed
+ * session in place and keeps its id, so the next turn continues the same
+ * conversation.
+ */
+const COMPACT_COMMAND = "/compact";
+
+/** The metadata a `compact_boundary` message carries about the compaction. */
+type CompactBoundary = Extract<
+  SystemMessage,
+  { subtype: "compact_boundary" }
+>["compact_metadata"];
+
+/** What one `/compact` run's message stream reported. */
+export interface CompactState {
+  boundary?: CompactBoundary;
+  failure: string;
+  resultText: string;
+}
+
+/** A usable token count, or undefined so an absent one degrades to "unreported". */
+const finiteCount = (value: number | undefined) =>
+  typeof value === "number" && Number.isFinite(value) ? value : undefined;
+
+/**
+ * Record what one SDK message says about the compaction. `compact_boundary` is
+ * the success signal and the only source of token counts; a `status` message
+ * with `compact_result: "failed"` is the CLI declining (e.g. "Not enough
+ * messages to compact."); the result message carries the run's own text, used
+ * as the fallback reason when nothing more specific was reported.
+ */
+export const observeCompactMessage = (state: CompactState, msg: SDKMessage) => {
+  if (msg.type === "system") {
+    if (msg.subtype === "compact_boundary") {
+      state.boundary = msg.compact_metadata;
+    } else if (msg.subtype === "status" && msg.compact_result === "failed") {
+      state.failure = msg.compact_error ?? state.failure;
+    }
+    return;
+  }
+  if (msg.type === "result") {
+    state.resultText =
+      msg.subtype === "success" ? msg.result : msg.errors.join("; ");
+  }
+};
+
+/** Terminal event for a finished `/compact` run: a boundary means it happened. */
+export const compactEventOf = (state: CompactState): CompactEvent =>
+  state.boundary
+    ? {
+        kind: "compact_done",
+        preTokens: finiteCount(state.boundary.pre_tokens),
+        postTokens: finiteCount(state.boundary.post_tokens),
+      }
+    : {
+        kind: "compact_failed",
+        reason:
+          state.failure || state.resultText || "Compaction reported no result.",
+      };
+
+/**
+ * Compact the resumed session in place. Runs no tools and touches no session
+ * store: the CLI rewrites the session file itself and keeps the id, so a failed
+ * compaction leaves the session exactly as it was. Yields exactly one terminal
+ * event; the caller (compact.ts) folds it into the reply.
+ */
+async function* compact(
+  opts: RunOptions,
+  signal: AbortSignal
+): AsyncGenerator<AgentEvent> {
+  if (!opts.sessionId) {
+    yield { kind: "compact_failed", reason: "No session to compact." };
+    return;
+  }
+  const abortController = new AbortController();
+  signal.addEventListener("abort", () => abortController.abort(), {
+    once: true,
+  });
+  const { settings } = runtime.runSync(readRunConfig);
+  const state: CompactState = { failure: "", resultText: "" };
+  for await (const msg of query({
+    prompt: COMPACT_COMMAND,
+    options: {
+      cwd: opts.projectDir,
+      resume: opts.sessionId,
+      settings,
+      abortController,
+    },
+  })) {
+    observeCompactMessage(state, msg);
+  }
+  yield compactEventOf(state);
+}
+
 /** Claude Code provider definition (Agent SDK) */
 export const claudeProvider: AgentProvider = {
   id: "claude",
   kind: "sdk",
   displayName: "Claude Code",
   capabilities: {
+    compaction: true,
     planMode: true,
     thinking: true,
     cost: true,
@@ -390,6 +492,7 @@ export const claudeProvider: AgentProvider = {
   ],
   defaultEffort: "high",
   run,
+  compact,
   listAllSessions,
   getSessionProject,
   clearSessionCache,
