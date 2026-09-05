@@ -11,6 +11,7 @@ import { Effect } from "effect";
 import { Bot, type Context, InlineKeyboard, Keyboard } from "grammy";
 import {
   clearSessionCache,
+  compactAgent,
   getCapabilities,
   getDefaultEffort,
   getEffortLevels,
@@ -20,6 +21,7 @@ import {
   listAllSessions,
   runAgent,
   stopAgent,
+  supportsCompaction,
 } from "./agent";
 import { classifyOutcome, runOutcomeOf } from "./agent/errors";
 import { listProviders } from "./agent/registry";
@@ -29,7 +31,7 @@ import {
   getSession,
   setSession,
 } from "./agent/session-store";
-import type { ProviderId } from "./agent/types";
+import type { CompactEvent, ProviderId } from "./agent/types";
 import {
   getCurrentBranch,
   getGitHubUrl,
@@ -310,6 +312,7 @@ const mainKeyboard = new Keyboard()
   .text("Stop")
   .text("New")
   .row()
+  .text("Compact")
   .text("Compose")
   .row()
   .resized()
@@ -439,6 +442,7 @@ export function createBot(
     History: "/history",
     Stop: "/stop",
     New: "/new",
+    Compact: "/compact",
     Compose: "/compose",
   };
   bot.use((ctx, next) => {
@@ -475,7 +479,7 @@ export function createBot(
     const state = getState(getUserId(ctx));
     const project = state.activeProject || "(none)";
     await ctx.reply(
-      `Coding agent bot ready.\nProvider: ${activeProviderName(state)}\nActive project: ${project}\n\nCommands:\n/projects - switch project\n/provider - switch coding agent provider\n/history - resume a past session\n/stop - kill active process\n/status - current state\n/new - reset session`,
+      `Coding agent bot ready.\nProvider: ${activeProviderName(state)}\nActive project: ${project}\n\nCommands:\n/projects - switch project\n/provider - switch coding agent provider\n/history - resume a past session\n/stop - kill active process\n/status - current state\n/new - reset session\n/compact - summarize session, keep going`,
       { reply_markup: mainKeyboard }
     );
   });
@@ -746,6 +750,7 @@ export function createBot(
         "/effort — switch reasoning effort for the active provider",
         "/history — resume a past session",
         "/new — start fresh conversation",
+        "/compact — summarize the current session and keep it",
         "/stop — kill active process",
         "/status — show current state",
         "/branch — show current git branch",
@@ -858,6 +863,99 @@ export function createBot(
       { reply_markup: mainKeyboard }
     );
   });
+
+  /**
+   * How a finished compaction reads. Token counts are only quoted when the
+   * provider reported both sides of the boundary; otherwise the reply just says
+   * it finished, rather than implying a number it does not have.
+   */
+  const describeCompaction = (
+    event: Extract<CompactEvent, { kind: "compact_done" }>
+  ) => {
+    const before = event.preTokens;
+    const after = event.postTokens;
+    const numbers =
+      before === undefined || after === undefined
+        ? ""
+        : ` Context: ${before.toLocaleString("en-US")} → ${after.toLocaleString("en-US")} tokens.`;
+    return `Compaction finished.${numbers} Same session — your next message continues it.`;
+  };
+
+  bot.command("compact", async (ctx) => {
+    const userId = getUserId(ctx);
+    const state = getState(userId);
+    const provider = state.activeProvider;
+    if (!supportsCompaction(provider)) {
+      await ctx.reply(
+        `${activeProviderName(state)} cannot compact a session. Use /new to start a fresh conversation.`,
+        { reply_markup: mainKeyboard }
+      );
+      return;
+    }
+
+    const project = state.activeProject;
+    const sessionId = project
+      ? await runtime.runPromise(getSession(project, provider))
+      : undefined;
+    if (!(project && sessionId)) {
+      await ctx.reply("No session to compact yet. Send a message first.", {
+        reply_markup: mainKeyboard,
+      });
+      return;
+    }
+
+    // Compaction rewrites the session, so it must not run underneath a live
+    // turn: interrupt one first, exactly as /new does.
+    const stopped = stopAgent(userId, "stopped");
+    const note = stopped ? "Stopped the run in progress first. " : "";
+    const status = await ctx.reply(
+      `Compacting ${describeProject(project, projectsDir)}...`
+    );
+
+    let outcome: CompactEvent;
+    try {
+      outcome = await compactAgent(provider, {
+        userId,
+        // Compaction carries no user turn; the provider supplies its own input.
+        prompt: "",
+        projectDir: project,
+        chatId: requireChat(ctx),
+        sessionId,
+      });
+    } catch (e) {
+      outcome = {
+        kind: "compact_failed",
+        reason: e instanceof Error ? e.message : "unknown error",
+      };
+    }
+    const text =
+      outcome.kind === "compact_done"
+        ? describeCompaction(outcome)
+        : `Compaction did not run: ${outcome.reason}\nThe session is unchanged.`;
+    await ctx.api
+      .editMessageText(requireChat(ctx), status.message_id, `${note}${text}`)
+      .catch(swallow);
+    await drainQueuedMessages(state, userId);
+  });
+
+  /**
+   * Process whatever queued up while compaction held the user's single process
+   * slot. The prompt path drains its own queue at the end of runAndDrain, so
+   * without this those messages would wait for the next prompt.
+   */
+  async function drainQueuedMessages(state: UserState, userId: number) {
+    const next = state.queue.shift();
+    if (!next) {
+      return;
+    }
+    if (state.queue.length === 0) {
+      await cleanupQueueStatus(state, next.ctx);
+    }
+    await notifyQueuedProcessing(next.ctx, next.prompt, state);
+    runAndDrain(next.ctx, next.prompt, state, userId).catch((e) =>
+      console.error("queue drain error:", e)
+    );
+  }
 
   bot.command("compose", async (ctx) => {
     const state = getState(getUserId(ctx));

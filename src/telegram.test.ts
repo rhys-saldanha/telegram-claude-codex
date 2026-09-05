@@ -5,6 +5,7 @@ import type { AgentEvent, ProviderCapabilities } from "./agent/types";
 import { splitText, streamToTelegram } from "./telegram";
 
 const FULL_CAPS: ProviderCapabilities = {
+  compaction: true,
   cost: true,
   planMode: true,
   subagents: true,

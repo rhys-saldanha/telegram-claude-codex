@@ -80,6 +80,7 @@ bot.start({
       { command: "effort", description: "Switch reasoning effort" },
       { command: "history", description: "Resume a past session" },
       { command: "new", description: "Start fresh conversation" },
+      { command: "compact", description: "Summarize session, keep it" },
       { command: "stop", description: "Kill active process" },
       { command: "status", description: "Show current state" },
       { command: "branch", description: "Show current git branch" },

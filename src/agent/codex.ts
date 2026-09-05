@@ -375,6 +375,12 @@ export const codexProvider: AgentProvider = {
   kind: "sdk",
   displayName: "Codex",
   capabilities: {
+    // The Codex SDK (0.146.0) exposes no compaction API: the whole surface is
+    // Codex.startThread/resumeThread plus Thread.run/runStreamed, and no
+    // ThreadEvent reports one. `codex exec` has no flag for it either, and its
+    // slash commands are TUI-only — so /compact declines for Codex rather than
+    // sending "/compact" as a literal prompt.
+    compaction: false,
     planMode: true,
     thinking: true,
     cost: false,
